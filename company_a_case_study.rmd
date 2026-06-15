@@ -1,0 +1,626 @@
+---
+title: "Company A Case Study"
+author: "David bricker"
+date: "2026-06-12"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Libraries
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(DBI)
+library(duckdb)
+library(MetBrewer)
+library(kableExtra)
+library(scales)
+```
+
+# Set working directory and duckdb connection
+```{r}
+setwd("C:/Users/brick/projects/ibotta_case_study")
+
+con <- dbConnect(duckdb())
+```
+
+# Questions
+## 1  Registrations by month
+```{r}
+
+signups_df <- dbGetQuery(
+  con, 
+  "
+  with monthly as (
+  select 
+    date_part('month', cast(registration_date as date)) as month_num
+  , count(distinct customer_id) as signups
+  from read_csv('shoppers.csv')
+  group by 1
+  order by 1 asc
+  )
+  select 
+  *
+  , sum(signups) over(order by month_num) as running_total
+  from monthly
+  "
+)
+
+write.csv(signups_df, "q1.csv",row.names = FALSE)
+```
+
+## 2 Most recent redemption by shopper
+```{r}
+latest_receipt <- dbGetQuery(
+  con,
+  "
+  with ranked_receipts as (
+  select 
+    so.customer_id as customer_id
+  , so.date_verified
+  , dense_rank() over(partition by so.customer_id order by so.date_verified desc) as rk
+  , so.receipt_id
+  , so.offer_id
+  , so.redemption_count
+  , o.reward_amount
+  , so.redemption_count * o.reward_amount as total_reward
+  from read_csv('shopper_offers.csv') so
+  left join read_csv('offers.csv') o
+  on so.offer_id = o.offer_id
+  )
+  select
+    customer_id
+  , date_verified
+  , count(distinct receipt_id) as receipts_verified
+  , sum(redemption_count) as offers_redeemed
+  , sum(reward_amount) as value
+  from ranked_receipts
+  where rk = 1
+  group by 1,2
+  ")
+
+write.csv(latest_receipt, "q2.csv")
+
+```
+
+## 3 Top 100 shoppers
+```{r}
+top_shoppers <- dbGetQuery(
+  con,
+  "
+  select 
+    so.customer_id as customer_id
+  , count(distinct so.offer_id) as unique_offers_redeemed
+  , sum(so.redemption_count) as total_offers_redeemed
+  , sum(so.redemption_count * o.reward_amount) as total_reward
+  from read_csv('shopper_offers.csv') so
+  left join read_csv('offers.csv') o
+  on so.offer_id = o.offer_id
+  group by customer_id
+  having sum(redemption_count) > 10 
+  qualify dense_rank() over(order by total_reward desc) <= 100
+  order by total_reward desc
+  ")
+
+write.csv(top_shoppers, "q3.csv", row.names = FALSE)
+```
+
+## 4 Days between unlock and redemption
+```{r}
+days_between <- dbGetQuery(
+  con,
+  "
+  with all_unlocks as (
+  select 
+    e.customer_id as customer_id
+  , e.event_at as unlock_ts
+  , e.offer_id
+  , so.date_verified as redemption_ts
+  , date_diff('day', cast(e.event_at as timestamp), cast(so.date_verified as timestamp)) as days_between
+  from read_csv('engagements.csv') e
+  left join read_csv('shopper_offers.csv') so
+    on e.customer_id = so.customer_id
+    and e.offer_id = so.offer_id
+    and e.event_at <= so.date_verified
+  where event_type = 'offer_unlock'
+  )
+  select
+    mean(days_between) as average_days_to_redeem
+  , sum(case when days_between is not null then 1 else 0 end) as total_redeemed
+  , count(distinct case when days_between is not null then offer_id else null end) as unique_redeemed
+  , sum(case when days_between is null then 1 else 0 end) as total_not_redeemed
+  , count(distinct case when days_between is null then offer_id else null end) as unique_not_redeemed  
+  from all_unlocks
+  "
+)
+
+
+check_unlock <- dbGetQuery(
+  con,
+  "
+  select 
+    customer_id as customer_id
+  , offer_id
+  , count(*)
+  from read_csv('engagements.csv') e
+  where event_type = 'offer_unlock'
+  group by 1,2
+  order by 3 desc
+  "
+)
+
+check_redemption <- dbGetQuery(
+  con,
+  "
+  select 
+    customer_id as customer_id
+  , offer_id
+  , count(*)
+  from read_csv('shopper_offers.csv')
+  group by 1,2
+  order by 3 desc
+  "
+)
+
+write.csv(days_between, "q4.csv", row.names = FALSE)
+
+```
+
+## 5 Shopper funnel
+```{r}
+funnel <- dbGetQuery(
+  con,
+  "
+  with step_counts as (
+  select 
+  count(distinct s.customer_id) as customers_registered
+  , count(distinct case when event_type = 'session_start' then e.customer_id else null end) as customers_started_session
+  , count(distinct case when event_type = 'retailer_view' then e.customer_id else null end) as customers_viewed_retailer
+  , count(distinct case when event_type = 'offer_unlock' then e.customer_id else null end) as customers_unlocked_offer
+  , count(distinct so.customer_id) as customers_redeemed_offer
+  from read_csv('shoppers.csv') s
+  left join read_csv('engagements.csv') e
+    on s.customer_id = e.customer_id
+  left join read_csv('shopper_offers.csv') so
+    on s.customer_id = so.customer_id
+  where date_part('month', s.registration_date) = 8
+  )
+  , step_counts_long as (
+  unpivot step_counts
+  on *
+  into 
+    name step
+    value customers
+  )
+  select
+   step
+  , customers
+  , lag(customers, 1, customers) over(order by customers desc) - customers as drop_off
+  , round((lag(customers, 1, customers) over(order by customers desc) - customers)/customers, 4) as drop_off_percent
+  from step_counts_long
+  "
+)
+
+write.csv(funnel, "q5.csv", row.names = FALSE)
+
+```
+
+# Presentation
+## Set chart theme
+```{r}
+db_theme <- theme(
+  plot.margin = unit(rep(1, 4), "cm"),
+  text = element_text(family = "sans"),
+  plot.title = element_text(size = 24, 
+                            face = "bold",
+                            color = "#222222", 
+                            margin = margin(b = 0)),
+  plot.subtitle = element_text(size = 16, 
+                               lineheight = 1.1,
+                               color = "#222222",
+                               margin = margin(b = 25)),
+  plot.caption = element_text(size = 12,
+                              margin = margin(t = 25), 
+                              color = "#222222"),
+  axis.title.x = element_text(margin = margin(t = 15), 
+                              color = "#222222"),
+  axis.title.y = element_text(margin = margin(r = 15), 
+                              color = "#222222"),
+  axis.text = element_text(color = "#222222"),
+  axis.line = element_line(color = "#222222"),
+  panel.grid.minor = element_blank(),
+  panel.grid.major = element_line(color = "#9BB8D3", 
+                                  linewidth = .001),
+  panel.background = element_rect(fill = "#F6F6F6", 
+                                  color = "#F6F6F6"),
+  legend.position = "bottom",
+  legend.text = element_text(color = "#222222"),
+  legend.title = element_text(color = "#222222")
+) 
+
+set_db_theme <- function() {
+  theme_set(theme_minimal(base_size = 18) +
+              db_theme)
+}
+set_db_theme()
+```
+
+## Health Snapshot
+```{r}
+# Monthly Signups
+
+monthly <- dbGetQuery(
+  con, 
+  "
+  select 
+    date_trunc('month', cast(cast(registration_date as timestamp) as date)) as month_num
+  , registration_device
+  , count(distinct customer_id) as signups
+  from read_csv('shoppers.csv')
+  group by 1,2
+  order by 1 asc
+  "
+)
+
+# Monthly sign up chart
+monthly |> 
+  ggplot(aes(month_num, signups, fill = registration_device)) +
+  geom_col() +
+  scale_x_date(date_labels = "%b",
+               date_breaks = "1 month") +
+  scale_fill_met_d("Degas") +
+  theme(legend.position = "bottom") +
+  labs(title = "2018 Signups Per Month",
+       y = "Customers Signing Up",
+       x = NULL,
+       fill = "Device Used:")
+
+# Monthly Sessions per user
+
+monthly_sessions <- dbGetQuery(
+  con,
+  "
+  select
+    date_trunc('month', cast(cast(event_at as timestamp) as date)) as month_num
+  , count(distinct case when event_type = 'session_start' then session_id else null end) as sessions
+  , count(distinct case when event_type = 'session_start' then customer_id else null end) as active_users
+    from read_csv('engagements.csv')
+    group by 1
+  "
+)
+
+# Monthly session per user chart
+
+monthly_sessions |> 
+  mutate(sessions_per_user = sessions/active_users) |> 
+  ggplot(aes(month_num, 
+             sessions_per_user)) +
+  geom_line(linewidth = 2,
+            color = "#E5A335FF",
+            show.legend = FALSE) +
+  geom_point(size = 4,
+             color = "#E5A335FF",
+             show.legend = FALSE) +
+  scale_x_date(date_labels = "%b-%y",
+               date_breaks = "1 month") +
+  scale_y_continuous(limits = c(0,40)) +
+  scale_color_met_d("Degas") +
+  theme(legend.position = "bottom") +
+  labs(title = "Sessions Per New User",
+       subtitle = "Users that had at least 1 session_start event",
+       y = NULL,
+       x = NULL,
+       color = NULL)
+
+# Monthly redemptions per user
+
+monthly_redemptions <- dbGetQuery(
+  con,
+  "
+  select
+  date_trunc('month', cast(cast(date_verified as timestamp) as date)) as month_num
+  , count(distinct customer_id) as customers
+  , sum(redemption_count) as redemptions
+  from read_csv('shopper_offers.csv')
+  group by 1
+  "
+)
+
+# Monthly redemptions per user chart
+
+monthly_redemptions |> 
+  mutate(redemptions_per_user = redemptions/customers) |> 
+  ggplot(aes(month_num, 
+             redemptions_per_user)) +
+  geom_line(linewidth = 2,
+            color = "#591D06FF",
+            show.legend = FALSE) +
+  geom_point(color = "#591D06FF",
+             size = 4,
+             show.legend = FALSE) +
+  scale_x_date(date_labels = "%b-%y",
+               date_breaks = "1 month") +
+  scale_y_continuous(limits = c(0,20)) +
+  theme(legend.position = "bottom") +
+  labs(title = "Redemptions Per New User",
+       subtitle = "Users that had at least 1 redemption event",
+       y = NULL,
+       x = NULL,
+       color = NULL)
+
+# Performance of monthly sign up cohorts
+
+cohort <- dbGetQuery(
+  con,
+  "
+  select 
+    date_trunc('month', cast(cast(registration_date as timestamp) as date)) as sign_up_month
+  , count(distinct s.customer_id) as new_customers
+  , sum(so.redemption_count) as six_month_redemptions
+  , count(distinct so.customer_id) as customers_redeeming
+  , count(distinct so.customer_id)/count(distinct s.customer_id) percent_redeeming
+  from read_csv('shoppers.csv') s
+  left join read_csv('shopper_offers.csv') so
+  on s.customer_id = so.customer_id
+  group by 1
+  "
+)
+
+# Create table for monthly cohort performance
+cohort |> 
+  mutate(percent_redeeming = percent(percent_redeeming, accuracy = .01)) |> 
+  arrange(sign_up_month) |> 
+  kbl(col.names = c(
+    "Sign Up Month",
+    "New Customer Signups",
+    "Total Redemptions",
+    "Unique Customers With Redemption",
+    "Percent Of Customers With Redemption"),
+    format.args = list(big.mark = ","),
+    align = c("l", rep("r", 4))) |> 
+  kable_paper(full_width = FALSE,
+                lightable_options = "striped")
+  
+```
+
+## Offers
+```{r}
+# Create data frame of all offers and how many times they were unlocked and
+# how many times they were redeemed.
+
+offer_performance <- dbGetQuery(
+  con,
+  "
+  select 
+    o.offer_id
+  , o.reward_amount
+  , sum(so.total_redemptions) total_redemptions
+  , sum(u.unlocks) as total_unlocks
+  from read_csv('offers.csv') o
+  left join 
+  (
+    select
+    offer_id
+    , sum(redemption_count) as total_redemptions
+    from read_csv('shopper_offers.csv')
+    group by 1
+  ) so
+  on o.offer_id = so.offer_id
+  left join 
+  (
+    select 
+    offer_id
+    , count(*) as unlocks
+    from read_csv('engagements.csv')
+    where event_type = 'offer_unlock'
+    group by 1
+  ) u
+  on o.offer_id = u.offer_id
+  group by 1,2
+  "
+)
+
+# Spot check offer unlock counts
+
+check <- dbGetQuery(
+  con,
+  "select 
+    offer_id
+    , count(*) as unlocks
+    from read_csv('engagements.csv')
+    where event_type = 'offer_unlock'
+    and offer_id = 1289460
+    group by 1
+    "
+)
+
+# Replace NAs with 0
+
+offer_performance <- offer_performance |> 
+  replace_na(list(total_redemptions = 0, total_unlocks = 0))
+
+# Top and bottom 10 redeemed/unlocked offers
+
+top_redemptions <- 
+  offer_performance |> 
+  arrange(desc(total_redemptions)) |> 
+  mutate(total_redemptions = comma(total_redemptions)) |>
+  select(-total_unlocks) |>
+  head(10) |> 
+  kbl(col.names = c(
+    "Offer ID",
+    "Reward Amount",
+    "Total Redemptions"),
+    align = c("l", "r", "r")) |> 
+  kable_paper(full_width = FALSE,
+                lightable_options = "striped")
+
+bottom_redemptions <- 
+  offer_performance |> 
+  arrange(total_redemptions) |> 
+  mutate(total_redemptions = comma(total_redemptions)) |>
+  select(-total_unlocks) |> 
+  head(10) |> 
+  kbl(col.names = c(
+    "Offer ID",
+    "Reward Amount",
+    "Total Redemptions"),
+    align = c("l", "r", "r")) |> 
+  kable_paper(full_width = FALSE,
+                lightable_options = "striped")
+
+top_unlocks <- 
+  offer_performance |> 
+  arrange(desc(total_unlocks)) |> 
+  mutate(total_unlocks = comma(total_unlocks)) |> 
+  select(-total_redemptions) |> 
+  head(10) |> 
+  kbl(col.names = c(
+    "Offer ID",
+    "Reward Amount",
+    "Total Unlocks"),
+    align = c("l", "r", "r")) |> 
+  kable_paper(full_width = FALSE,
+                lightable_options = "striped")
+
+bottom_unlocks <- 
+  offer_performance |> 
+  arrange(total_unlocks) |> 
+  mutate(total_unlocks = comma(total_unlocks)) |> 
+  select(-total_redemptions) |> 
+  head(10) |> 
+  kbl(col.names = c(
+    "Offer ID",
+    "Reward Amount",
+    "Total Unlocks"),
+    align = c("l", "r", "r")) |> 
+  kable_paper(full_width = FALSE,
+                lightable_options = "striped")
+
+# Count how many offers were never redeemed and how many were unlocked once.
+
+n_distinct(offer_performance$offer_id[offer_performance$total_redemptions == 0])
+n_distinct(offer_performance$offer_id[offer_performance$total_unlocks == 1])
+
+# Create scatter plot of offer value and redemption count.
+
+offer_performance |> 
+  filter(total_redemptions > 0) |> 
+  ggplot(aes(
+    reward_amount,
+    total_redemptions
+  )) +
+  geom_point(color = "#053C29FF",
+             alpha = 0.2) +
+  scale_y_continuous(limits = c(0,1000))+
+  scale_x_continuous(limits = c(0,10)) +
+  labs(title = "Reward Amount vs Number of Redemptions",
+       subtitle = "Offers with >= 1 Redemption",
+       y = "Redemptions",
+       x = "Reward Amount")
+```
+
+## Funnel
+```{r}
+# Create data frame of monthly funnel step through. 
+# This funnel will measure number of sessions/events NOT the number of unique 
+# customers at each step.
+
+monthly_funnel <- dbGetQuery(
+  con,
+  "
+  with monthly_engagements as (
+    select 
+      date_trunc('month', cast(event_at as timestamp)) as month_num
+    , count(distinct case when event_type = 'session_start' then session_id else null end) as sessions
+    , sum(case when event_type = 'retailer_view' then 1 else 0 end) as retailer_views
+    --, count(distinct case when event_type = 'retailer_view' then session_id else null end) as retailer_views
+    , sum(case when event_type = 'offer_unlock' then 1 else 0 end) as offer_unlocks
+    --, count(distinct case when event_type = 'offer_unlock' then session_id else null end) as offer_unlocks
+    from read_csv('engagements.csv')
+    group by 1
+  ),
+  monthly_offers as (
+    select
+      date_trunc('month', cast(date_verified as timestamp)) as month_num
+    , sum(redemption_count) as total_offers_redeemed
+    from read_csv('shopper_offers.csv')
+    group by 1
+  )
+  
+  select 
+    me.month_num
+  , me.sessions
+  , me.retailer_views
+  , me.offer_unlocks
+  , coalesce(mo.total_offers_redeemed, 0) as offers_redeemed
+  from monthly_engagements me
+  left join monthly_offers mo 
+    on me.month_num = mo.month_num
+  order by 1
+  "
+)
+
+# Add step through rates and views per session columns
+monthly_funnel <- monthly_funnel |> 
+  mutate(session_to_view = retailer_views/sessions,
+         view_to_unlock = offer_unlocks/retailer_views,
+         unlock_to_redeem = offers_redeemed/offer_unlocks)
+
+# visualize in line charts
+
+monthly_funnel |> 
+  ggplot(aes(
+    month_num,
+    session_to_view
+  )) +
+  geom_line(linewidth = 2,
+            color = "#96410EFF") +
+  geom_point(size = 4,
+            color = "#96410EFF") +
+  scale_x_date(date_labels = "%b-%y",
+               date_breaks = "1 month") +
+  scale_y_continuous(limits = c(0,5)) +
+  labs(title = "Retailer Views Per Session",
+       x = NULL,
+       y = "Views")
+
+monthly_funnel |> 
+  ggplot(aes(
+    month_num,
+    view_to_unlock
+  )) +
+  geom_line(linewidth = 2,
+            color = "#E5A335FF") +
+  geom_point(size = 4,
+            color = "#E5A335FF") +
+  scale_x_date(date_labels = "%b-%y",
+               date_breaks = "1 month") +
+  scale_y_continuous(labels = percent,
+                     limits = c(0,1)) +
+  labs(title = "Retailer View To Offer Unlock",
+       x = NULL,
+       y = "Offer Unlock Rate")
+
+monthly_funnel |> 
+  ggplot(aes( 
+    month_num,
+    unlock_to_redeem
+  )) +
+  geom_line(linewidth = 2,
+            color = "#556219FF") +
+  geom_point(size = 4,
+            color = "#556219FF") +
+  scale_x_date(date_labels = "%b-%y",
+               date_breaks = "1 month") +
+  scale_y_continuous(labels = percent,
+                     limits = c(0,1)) +
+  labs(title = "Offer Unlock To Offer Redemption",
+       x = NULL,
+       y = "Offer Redeemption Rate")
+
+```
+
